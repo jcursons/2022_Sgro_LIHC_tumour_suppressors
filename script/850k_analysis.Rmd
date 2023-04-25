@@ -1,0 +1,623 @@
+---
+title: "Methylation analysis"
+output: html_document
+---
+
+
+# Set up
+set paths and read libraries. Then read the data and sample info.
+```{r}
+# mainDir <- getwd()
+
+outPath <- "C:/git/pyscript/papers/lihc_methylated_suppressors/figures"
+figPath <- "C:/git/pyscript/papers/lihc_methylated_suppressors/figures"
+# dataPath <- "/Users/mfor0011/Documents/data/Pilar/DNAme_Hep3B/ILMLEPIC-17782/"
+dataPath <- "C:/data/blancafort/ILMLEPIC-17782"
+scriptPath <- "../script/"
+
+
+## generate the outPath, figPath, dataPath, and scriptPath folders (as above) if they do not already exist - note that the current Rmd file is under the "../report" folder.
+#ifelse(!dir.exists(file.path(mainDir, outPath)), dir.create(file.path(mainDir, outPath)), FALSE)
+#ifelse(!dir.exists(file.path(mainDir, figPath)), dir.create(file.path(mainDir, figPath)), FALSE)
+#ifelse(!dir.exists(file.path(mainDir, dataPath)), dir.create(file.path(mainDir, dataPath)), FALSE)
+
+##----- install the EPIC packages (uncomment the below code):
+# BiocManager::install("IlluminaHumanMethylationEPICmanifest")
+# BiocManager::install("IlluminaHumanMethylationEPICanno.ilm10b2.hg19")
+
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(edgeR)
+
+
+currentCols <-  c(
+  brewer.pal(8, "Dark2")[-5],
+  brewer.pal(10, "Paired"),
+  brewer.pal(12, "Set3"),
+  brewer.pal(9, "Blues")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "Oranges")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "Greens")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "Purples")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "Reds")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "Greys")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "BuGn")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "PuRd")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "BuPu")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(9, "YlGn")[c(8, 3, 7, 4, 6, 9, 5)],
+  brewer.pal(10, "Paired")
+  )
+
+## call custom functions for doing PCA or visualisations
+#source(paste0(scriptPath, "PCA_plot.R"))
+#source(paste0(scriptPath, "plotHeatmapExpr.R"))
+```
+
+
+# Manual analysis
+## Read data
+```{r}
+targets <- read.metharray.sheet(dataPath)
+listSamples <- targets$Sample_Name
+
+targets$Sample_Group <- c("Hep3B_A", "Hep3B_A", "Hep3B_A", "Hep3B_A", "Hep3B_A_NoG", "Hep3B_A_NoG", "Hep3B_A_NoG", "Hep3B_A_NoG", "Hep3B_i", "Hep3B_i", "Hep3B_i", "Hep3B_i", "Hep3B_i_NoG", "Hep3B_i_NoG", "Hep3B_i_NoG", "Hep3B_i_NoG")
+
+rgSet <- read.metharray.exp(targets = targets)
+
+pd <- pData(rgSet)
+pd[,1:4]
+```
+
+we have two types of annotation packages: “manifest” packages which contains the array design and “annotation” packages which contains information about where the methylation loci are located on the genome, which genomic features they map to and possible whether they overlap any known SNPs
+```{r}
+annotation(rgSet)
+#                     array
+# "IlluminaHumanMethylationEPIC" 
+#                     annotation 
+#                 "ilm10b4.hg19" 
+```
+
+We used missMethyl to process the raw data, and applied Subset-quantile Within Array Normalisation (SWAN) normalization. We filtered poor quality probes based on the detection p-values, such that we only retained probes with p-value less than 0.01 in all samples. After adding an offset of 100 to methylated and umethylated channels separately, we calculated the M and extract beta values.
+```{r}
+library(missMethyl)
+mSet <- preprocessRaw(rgSet)
+
+set.seed(20211010)
+mSetSw <- SWAN(mSet, verbose = TRUE)
+```
+
+```{r}
+par(mfrow = c(1,2), cex=1.25)
+densityByProbeType(mSet[,1], main = "Raw")
+densityByProbeType(mSetSw[,1], main = "SWAN")
+```
+
+## Filter low quality probes
+Poor quality probes can be filtered out based on the detection p-value. For this example, to retain a CpG for further analysis, we require that the detection p-value is less than 0.01 in all samples.
+```{r}
+detP <- detectionP(rgSet)
+keep <- rowSums(detP < 0.01) == ncol(rgSet)
+summary(keep)
+mSetSw <- mSetSw[keep,]
+
+#    Mode   FALSE    TRUE 
+# logical    2989  863249 
+```
+
+Now that the data has been SWAN normalised we can extract β and M-values from the object. We prefer to add an offset to the methylated and unmethylated intensities when calculating M-values, hence we extract the methylated and unmethylated channels separately and perform our own calculation. 
+
+```{r}
+set.seed(20201010)
+# mset_reduced <- mSetSw[sample(1:nrow(mSetSw), 20000),]
+meth <- getMeth(mSetSw)
+unmeth <- getUnmeth(mSetSw)
+Mval <- log2((meth + 100)/(unmeth + 100))
+beta <- getBeta(mSetSw)
+dim(Mval)
+```
+
+select a subset with high beta values for further QC
+```{r}
+set.seed(20201010)
+# mset_reduced <- mSetSw[sample(1:nrow(mSetSw), 20000),]
+keep <- rowMeans(beta) > 0.2
+betaHighMeanMeth <- beta[keep,]
+dim(betaHighMeanMeth)
+```
+
+# QC
+
+## Hist of B values
+```{r}
+## open a pdf to export the figures
+pdf(paste0(figPath, "Hist_BetaValues.pdf"),
+    height = 4.3,
+    width = 5)
+## Plot the first WT sample
+i <-  1
+plot(
+  density(beta[, i], from = 0, to = 1),
+  main = "",
+  ylim = c(0, 4),
+  type = "n"
+)
+
+## add the other samples
+for (i in 1:16) {
+  lines(density(beta[, i], from = 0, to = 1), col =  currentCols[i])
+}
+
+legend(
+  "center",
+  legend = listSamples,
+  col = currentCols[1:16],
+  lty = 1,
+  lwd = 2, cex = 0.5
+)
+dev.off()
+
+##----- Hist of high Beta values
+## open a pdf to export the figures
+pdf(paste0(figPath, "Hist_BetaValues_HighMeth.pdf"),
+    height = 4.3,
+    width = 5)
+## Plot the first WT sample
+i <-  1
+plot(
+  density(betaHighMeanMeth[, i], from = 0, to = 1),
+  main = "",
+  ylim = c(0, 4),
+  type = "n"
+)
+
+## add the other samples
+for (i in 1:16) {
+  lines(density(betaHighMeanMeth[, i], from = 0, to = 1), col =  currentCols[i])
+}
+
+legend(
+  "center",
+  legend = listSamples,
+  col = currentCols[1:16],
+  lty = 1,
+  lwd = 2, cex = 0.5
+)
+dev.off()
+```
+
+## MDS plot
+**Sep: I have changed a few parameters here, nothing important but mainly to fix the colours; you could do similar thing in the next couple of code chunks**
+```{r}
+par(mfrow = c(1, 1))
+
+pdf(paste0(figPath, "MDS_SWAN_beta.pdf"),
+    height = 5,
+    width = 5)
+plotMDS(beta,
+        labels = targets$Sample_Name,
+        col = currentCols[as.integer(factor(targets$Sample_Group))],
+        cex = 0.8)
+# op <- par(cex = 0.5)
+
+legend(
+  "topleft",
+  legend = unique(factor(targets$Sample_Group)),
+  col = currentCols[as.integer(unique(factor(targets$Sample_Group)))],
+  lty = 1,
+  lwd = 2, 
+  cex = 0.5
+)
+dev.off()
+
+```
+
+## MDS plot - high Beta values
+```{r}
+par(mfrow = c(1, 1))
+
+pdf(
+  paste0(figPath, "MDS_SWAN_HighBeta.pdf"),
+  height = 5,
+  width = 5
+)
+plotMDS(betaHighMeanMeth,
+        labels = targets$Sample_Name,
+        col = currentCols[as.integer(factor(targets$Sample_Group))],
+        cex = 0.8)
+# op <- par(cex = 0.5)
+
+legend(
+  "topleft",
+  legend = unique(factor(targets$Sample_Group)),
+  col = currentCols[as.integer(unique(factor(targets$Sample_Group)))],
+  lty = 1,
+  lwd = 2, 
+  cex = 0.5
+)
+dev.off()
+
+```
+
+## MDS plot - high Beta values & drop outliers (Hep3B_A1 [#1], Hep3B_i1 [9], Hep3B_NO_G_L1 [13])
+```{r}
+par(mfrow = c(1, 1))
+
+pdf(
+  paste0(figPath, "MDS_SWAN_HighBeta_DropOutliers.pdf"),
+  height = 5,
+  width = 5
+)
+plotMDS(betaHighMeanMeth[,c(2:8, 10:12, 14:16)], labels = listSamples[c(2:8, 10:12, 14:16)], col = currentCols[as.integer(factor(targets$Sample_Group[c(2:8, 10:12, 14:16)]))])
+op <- par(cex = 0.5)
+legend(
+  "topright",
+  legend = listSamples,
+  col = currentCols[c(2:8, 10:12, 14:16)],
+  lty = 1,
+  lwd = 2
+)
+dev.off()
+
+```
+
+
+## PCA
+```{r}
+source(paste0(scriptPath, "PCA_plot.R"))
+
+s <-
+  svd(apply(beta[,], 1, function(x)
+    scale(x, scale = FALSE , center = TRUE)))
+
+## we need to add a column called SampleID to the annotation data so that my custom PCA_plot function works
+pd$SampleID <- colnames(beta)
+pdf(
+  paste0(figPath, "PCA_Beta_SWAN.pdf"),
+  height = 7,
+  width = 7
+)
+PCA_plot (
+  expr = beta[,],
+  clin = pd,
+  group_to_test = "Sample_Group",
+  # data = "data",
+  svdResult = s,
+  plot_cex = 1.2,
+  legend_cex = 1.2,
+  labeled = FALSE,
+  group_to_shape = NULL,
+  cols = currentCols
+)
+dev.off()
+
+
+##------------- High beta:
+
+sHigh <-
+  svd(apply(betaHighMeanMeth, 1, function(x)
+    scale(x, scale = FALSE , center = TRUE)))
+
+pdf(
+  paste0(figPath, "PCA_Beta_SWAN_HighBeta.pdf"),
+  height = 7,
+  width = 7
+)
+PCA_plot (
+  expr = betaHighMeanMeth,
+  clin = pd,
+  group_to_test = "Sample_Group",
+  # data = "data",
+  svdResult = sHigh,
+  plot_cex = 1.2,
+  legend_cex = 1.2,
+  labeled = FALSE,
+  group_to_shape = NULL,
+  cols = currentCols
+)
+dev.off()
+```
+
+### Get gene names for DM probes:
+
+Tidy up gene column such that genes separated by ";" will be in separate rows. Then, subset the data to desired probes and merge them to beta value data by only taking the overlapping probes.
+
+Some useful funstions are : 
+print this:
+getAnnotationObject(IlluminaHumanMethylationEPICanno.ilm10b2.hg19) to see which options are available for what.
+
+getProbeType and getIslandStatus, which return a character vector with the requested information
+```{r}
+annProbe <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+# maptGenome <- mapToGenome(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+
+
+annProbeRow <-
+  tidyr::separate_rows(data.frame(annProbe),
+                       UCSC_RefGene_Name,
+                       UCSC_RefGene_Group,
+                       sep = ";")
+
+## export for future use:
+# saveRDS(annProbeRow, paste0(outPath, "ProbeEPIC_Annotation_hg19_Long.RDS"))
+# annProbeRow <- readRDS(paste0(outPath, "ProbeEPIC_Annotation_hg19_Long.RDS"))
+
+sum(duplicated(annProbeRow$Name))
+# [1] 743581
+
+annUniqProbe <- annProbeRow[! duplicated(annProbeRow$Name), ]
+rownames(annUniqProbe) <- annUniqProbe$Name
+
+## extract common probes:
+annUniqProbe <- annUniqProbe[rownames(Mval), ]
+
+## save the data
+# saveRDS(annUniqProbe, paste0(outPath, "Annotation_Unique_Probe_MvalsOverlapped.RDS"))
+
+```
+
+### Extract probes for specific targets
+```{r}
+dfBeta = data.frame(beta)
+colnames(dfBeta) = pd$Sample_Name
+
+for (strGene in c(
+  "HHIP"
+)) {
+  listProbes <-  annUniqProbe$Name[grepl(strGene, annUniqProbe$UCSC_RefGene_Name)]
+  dfForGene <-  dfBeta[listProbes, ]
+  
+  write.table(
+    dfForGene,
+    paste0(outPath, strGene, "_beta.tsv"),
+    sep = "\t",
+    row.names = T
+  )
+  
+}
+```
+
+### Genes with high loading in PCA
+```{r}
+head(s$v)
+rownames(s$v) <- rownames(beta)
+s$v <- s$v[order(s$v[, 1]), ]
+
+tail(s$v)
+```
+
+
+# DE analysis
+
+## limma
+```{r}
+listGroups <- targets$Sample_Group
+
+group <- factor(listGroups)
+design <- model.matrix(~ 0 + group)
+design
+
+colnames(design) <- c(
+  "Hep3B_A", 
+  "Hep3B_A_NoG", 
+  "Hep3B_i",
+  "Hep3B_i_NoG"
+  )
+
+contr.matrix <- makeContrasts(
+  A_NoG   = Hep3B_A - Hep3B_A_NoG,
+  i_NoG  = Hep3B_i - Hep3B_i_NoG,
+  ## I have added a comparison between Hep3B_A and Hep3B_i
+  a_i = Hep3B_A - Hep3B_i,
+  NoGuide_Comp = Hep3B_A_NoG - Hep3B_i_NoG,
+  levels = colnames(design)
+)
+
+contr.matrix
+
+fit <- lmFit(beta, design)
+fit <- contrasts.fit(fit, contrasts = contr.matrix)
+fit <- eBayes(fit)
+
+dt <- decideTests(fit)
+summary(dt)
+#         A_NoG  i_NoG    a_i NoGuide_Comp
+# Down        0      1      0            3
+# NotSig 863247 863247 863249       863244
+# Up          2      1      0            2
+
+
+
+##------- High Beta:
+
+# fitH <- lmFit(betaHighMeanMeth, design)
+# fitH <- contrasts.fit(fitH, contrasts = contr.matrix)
+# fitH <- eBayes(fitH)
+# 
+# dtH <- decideTests(fitH)
+# summary(dtH)
+
+#         A_NoG  i_NoG    a_i NoGuide_Comp
+# Down        0      0      0            0
+# NotSig 585692 585692 585692       585692
+# Up          0      0      0            0
+
+##------
+
+
+top_A_NoG   <- topTable(fit, coef = "A_NoG", n = Inf)
+top_i_NoG  <- topTable(fit, coef = "i_NoG", n = Inf)
+top_NoGuide_Comp <- topTable(fit, coef = "NoGuide_Comp", n = Inf)
+
+top_A_NoG$Probes <- row.names(top_A_NoG)
+top_i_NoG$Probes <- row.names(top_i_NoG)
+top_NoGuide_Comp$Probes <- row.names(top_NoGuide_Comp)
+
+## export DE stats: 
+# saveRDS(fit, paste0(outPath, "fit_limma.RDS"))
+# saveRDS(targets, paste0(outPath, "targets.RDS"))
+```
+
+
+produce the output
+```{r}
+
+##------- merge with DMPs:
+getCols <-
+  c(
+    'chr',
+    'pos',
+    'strand',
+    'Type',
+    'Relation_to_Island',
+    'UCSC_RefGene_Name',
+    'UCSC_RefGene_Accession',
+    'UCSC_RefGene_Group',
+    'Regulatory_Feature_Group'
+  )
+
+top_A_NoG <-
+  merge(top_A_NoG,
+        annUniqProbe[, getCols],
+        by.x = "Probes",
+        by.y = 'row.names')
+
+top_i_NoG <-
+  merge(top_i_NoG,
+        annUniqProbe[, getCols],
+        by.x = "Probes",
+        by.y = 'row.names')
+
+top_NoGuide_Comp <-
+  merge(top_NoGuide_Comp,
+        annUniqProbe[, getCols],
+        by.x = "Probes",
+        by.y = 'row.names')
+
+
+## 87638
+DMPs_A_NoG   <-
+  top_A_NoG[top_A_NoG$adj.P.Val < 0.3 &
+                 abs(top_A_NoG$logFC) > 0.05, ]
+
+# 14491
+DMPs_i_NoG  <-
+  top_i_NoG[top_i_NoG$adj.P.Val < 0.3 &
+                  abs(top_i_NoG$logFC) > 0.05, ]
+# 113737
+DMPs_NoGuide_Comp <-
+  top_NoGuide_Comp[top_NoGuide_Comp$adj.P.Val < 0.3 &
+                  abs(top_NoGuide_Comp$logFC) > 0.05, ]
+
+
+write.table(
+  DMPs_A_NoG,
+  paste0(outPath, "DMPs_limma_SWAN_A_NoG.txt"),
+  sep = "\t",
+  row.names = F
+)
+write.table(
+  DMPs_i_NoG,
+  paste0(outPath, "DMPs_limma_SWAN_i_NoG.txt"),
+  sep = "\t",
+  row.names = F
+)
+# write.table(
+#   DMPs_NoGuide_Comp,
+#   paste0(outPath, "DMPs_limma_SWAN_NoGuide_Comp.txt"),
+#   sep = "\t",
+#   row.names = F
+# )
+
+
+write.table(
+  top_A_NoG,
+  paste0(outPath, "AllProbes_limma_SWAN_A_NoG.txt"),
+  sep = "\t",
+  row.names = F
+)
+write.table(
+  top_i_NoG,
+  paste0(outPath, "AllProbes_limma_SWAN_i_NoG.txt"),
+  sep = "\t",
+  row.names = F
+)
+
+
+```
+
+
+
+```{r}
+# 
+# pdf(paste0(figPath, "cg16559010.pdf"), height = 4, width = 6)
+# 
+# barplot(betaHighMeanMeth["cg16559010",],
+# main = "Probe metyhlation (cg16559010)",
+# xlab = "Passage",
+# ylab = "Beta value",
+# names.arg = listSamples,
+# col = "darkred")
+# 
+# dev.off()
+
+```
+
+
+
+#### ZEB1 probes groups
+```{r}
+source(paste0(scriptPath, "plotHeatmapExpr.R"))
+# DMPs <- DMPs_EV_WT
+DMPs <- DMPs_Guide_EV
+# DMPs <- DMPs_Guide_WT
+
+Zeb1 <- betaHighMeanMeth[grepl("HHIP", DMPs$UCSC_RefGene_Name), ]
+# colnames(Zeb1)[1] <- "Probe"
+
+textSize <- 10
+
+sampleCol <- currentCols[c(1, 2, 3)]
+names(sampleCol) <-
+  c("Guide", "EV", "WT")
+
+sampleColList <-  list(
+  Sample_Group = sampleCol
+)
+
+sampleHm <- ComplexHeatmap::HeatmapAnnotation(Sample_Group = as.factor(pd$Sample_Group), col = sampleColList)
+
+geneAnn <- Zeb1[, "UCSC_RefGene_Group", drop = F]
+colnames(geneAnn) <- "Probe_Group"
+
+rownames(geneAnn) <- Zeb1$Probes
+
+geneCol <- currentCols[3:5]
+names(geneCol) <- names(table(geneAnn$Probe_Group))
+
+geneColList <- list(
+  Probe_Group = geneCol
+  )
+
+geneHm <-
+  ComplexHeatmap::rowAnnotation(df = geneAnn, col = geneColList)
+
+
+pdf(
+  paste0(figPath, "Heatmap_ZEB1_Probes_Beta_Guide_WT.pdf"),
+  height = 8,
+  width = 7
+)
+
+ComplexHeatmap::Heatmap(
+  beta[Zeb1$Probes,],
+  right_annotation  = geneHm,
+  top_annotation = sampleHm,
+  name = "Beta-value",
+  col = brewer.pal(8, "Blues")
+)
+
+dev.off()
+
+```
+
